@@ -7,6 +7,9 @@
 //!
 //! [1]: http://en.wikipedia.org/wiki/Tar_%28computing%29
 
+// More docs about the detailed tar format can also be found here:
+// http://www.freebsd.org/cgi/man.cgi?query=tar&sektion=5&manpath=FreeBSD+8-current
+
 #![doc(html_root_url = "http://alexcrichton.com/tar-rs")]
 #![deny(missing_docs)]
 #![cfg_attr(test, deny(warnings))]
@@ -24,6 +27,7 @@ use std::fs;
 use std::io::prelude::*;
 use std::io::{self, Error, ErrorKind, SeekFrom};
 use std::iter::repeat;
+use std::marker;
 use std::mem;
 use std::path::{Path, PathBuf, Component};
 use std::str;
@@ -34,96 +38,26 @@ use filetime::FileTime;
 #[cfg(unix)] use std::ffi::{OsStr, OsString};
 #[cfg(windows)] use std::os::windows::prelude::*;
 
-macro_rules! try_iter{ ($me:expr, $e:expr) => (
-    match $e {
+macro_rules! try_iter {
+    ($me:expr, $e:expr) => (match $e {
         Ok(e) => e,
         Err(e) => { $me.done = true; return Some(Err(e)) }
-    }
-) }
-
-// https://golang.org/pkg/archive/tar/#pkg-constants
-/// Entry types recognised in the high level API
-#[derive(Clone, Copy, PartialEq)]
-enum EntryType {
-    /// Regular file
-    Regular,
-    /// Hard link
-    Link,
-    /// Symbolic link
-    Symlink,
-    /// Character device
-    Char,
-    /// Block device
-    Block,
-    /// Directory
-    Directory,
-    /// Named pipe (fifo)
-    Fifo,
-    /// Implementation-defined 'high-performance' type, treated as regular file
-    Continuous,
-    /// Extended Header
-    XHeader,
-    /// Global extended header
-    XGlobalHeader,
-    /// GNU extension - long file name
-    GNULongName,
-    /// GNU extension - long link name (link target)
-    GNULongLink,
-    /// GNU extension - sparse file
-    GNUSparse,
-
-    /// Unknown - special case to allow filling metadata into a header without
-    /// having to handle errors, converts into a ' '
-    Unknown,
+    })
 }
 
-impl EntryType {
-    fn from_byte(byte: u8) -> Option<EntryType> {
-        match byte {
-            b'\x00' |
-            b'0' => Some(EntryType::Regular),
-            b'1' => Some(EntryType::Link),
-            b'2' => Some(EntryType::Symlink),
-            b'3' => Some(EntryType::Char),
-            b'4' => Some(EntryType::Block),
-            b'5' => Some(EntryType::Directory),
-            b'6' => Some(EntryType::Fifo),
-            b'7' => Some(EntryType::Continuous),
-            b'x' => Some(EntryType::XHeader),
-            b'g' => Some(EntryType::XGlobalHeader),
-            b'L' => Some(EntryType::GNULongName),
-            b'K' => Some(EntryType::GNULongLink),
-            b'S' => Some(EntryType::GNUSparse),
-            _ => None,
-        }
-    }
-
-    fn to_byte(&self) -> u8 {
-        match self {
-            &EntryType::Regular       => b'0',
-            &EntryType::Link          => b'1',
-            &EntryType::Symlink       => b'2',
-            &EntryType::Char          => b'3',
-            &EntryType::Block         => b'4',
-            &EntryType::Directory     => b'5',
-            &EntryType::Fifo          => b'6',
-            &EntryType::Continuous    => b'7',
-            &EntryType::XHeader       => b'x',
-            &EntryType::XGlobalHeader => b'g',
-            &EntryType::GNULongName   => b'L',
-            &EntryType::GNULongLink   => b'K',
-            &EntryType::GNUSparse     => b'S',
-            &EntryType::Unknown       => b' ',
-        }
-    }
-}
+// NB: some of the coding patterns and idioms here may seem a little strange.
+//     This is currently attempting to expose a super generic interface while
+//     also not forcing clients to codegen the entire crate each time they use
+//     it. To that end lots of work is done to ensure that concrete
+//     implementations are all found in this crate and the generic functions are
+//     all just super thin wrappers (e.g. easy to codegen).
 
 /// A top-level representation of an archive file.
 ///
 /// This archive can have an entry added to it and it can be iterated over.
-pub struct Archive<R> {
-    obj: RefCell<R>,
+pub struct Archive<R: ?Sized> {
     pos: Cell<u64>,
+    obj: RefCell<R>,
 }
 
 /// Backwards compatible alias for `Entries`.
@@ -133,8 +67,16 @@ pub type Files<'a, T> = Entries<'a, T>;
 /// An iterator over the entries of an archive.
 ///
 /// Requires that `R` implement `Seek`.
-pub struct Entries<'a, R:'a> {
-    archive: &'a Archive<R>,
+pub struct Entries<'a, R: 'a + ?Sized> {
+    fields: EntriesFields<'a>,
+    _ignored: marker::PhantomData<&'a R>,
+}
+
+struct EntriesFields<'a> {
+    // Need a version with Read + Seek so we can call _seek
+    archive: &'a Archive<ReadAndSeek + 'a>,
+    // ... but we also need a literal Read so we can call _next_entry
+    archive_read: &'a Archive<Read + 'a>,
     done: bool,
     offset: u64,
 }
@@ -147,8 +89,13 @@ pub type FilesMut<'a, T> = EntriesMut<'a, T>;
 ///
 /// Does not require that `R` implements `Seek`, but each entry must be
 /// processed before the next.
-pub struct EntriesMut<'a, R:'a> {
-    archive: &'a Archive<R>,
+pub struct EntriesMut<'a, R: 'a + ?Sized> {
+    fields: EntriesMutFields<'a>,
+    _ignored: marker::PhantomData<&'a R>,
+}
+
+struct EntriesMutFields<'a> {
+    archive: &'a Archive<Read + 'a>,
     next: u64,
     done: bool,
 }
@@ -162,16 +109,21 @@ pub type File<'a, T> = Entry<'a, T>;
 /// This structure is a window into a portion of a borrowed archive which can
 /// be inspected. It acts as a file handle by implementing the Reader and Seek
 /// traits. An entry cannot be rewritten once inserted into an archive.
-pub struct Entry<'a, R: 'a> {
+pub struct Entry<'a, R: 'a + ?Sized> {
+    fields: EntryFields<'a>,
+    _ignored: marker::PhantomData<&'a R>,
+}
+
+struct EntryFields<'a> {
     header: Header,
-    archive: &'a Archive<R>,
+    archive: &'a Archive<Read + 'a>,
     pos: u64,
     size: u64,
 
     // Used in read() to make sure we're positioned at the next byte. For a
     // `Entries` iterator these are meaningful while for a `EntriesMut` iterator
     // these are both unused/noops.
-    seek: fn(&Entry<R>) -> io::Result<()>,
+    seek: Box<Fn(&EntryFields) -> io::Result<()> + 'a>,
     tar_offset: u64,
 }
 
@@ -199,6 +151,14 @@ pub struct Header {
     pub prefix: [u8; 155],
     _rest: [u8; 12],
 }
+
+// See https://en.wikipedia.org/wiki/Tar_%28computing%29#UStar_format
+/// Indicate for the type of file described by a header.
+///
+/// Each `Header` has an `entry_type` method returning an instance of this type
+/// which can be used to inspect what the header is describing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EntryType { byte: u8 }
 
 #[doc(hidden)]
 #[derive(Debug)]
@@ -228,6 +188,7 @@ impl<R: Seek + Read> Archive<R> {
     pub fn files(&self) -> io::Result<Entries<R>> {
         self.entries()
     }
+
     /// Construct an iterator over the entries of this archive.
     ///
     /// This function can return an error if any underlying I/O operation fails
@@ -237,12 +198,28 @@ impl<R: Seek + Read> Archive<R> {
     /// to handle invalid tar archives as well as any intermittent I/O error
     /// that occurs.
     pub fn entries(&self) -> io::Result<Entries<R>> {
-        try!(self.seek(0));
-        Ok(Entries { archive: self, done: false, offset: 0 })
+        let me: &Archive<ReadAndSeek> = self;
+        try!(me._seek(0));
+        Ok(Entries {
+            fields: EntriesFields {
+                archive: self,
+                archive_read: self,
+                done: false,
+                offset: 0,
+            },
+            _ignored: marker::PhantomData,
+        })
     }
+}
 
-    fn seek(&self, pos: u64) -> io::Result<()> {
-        if self.pos.get() == pos { return Ok(()) }
+trait ReadAndSeek: Read + Seek {}
+impl<R: ?Sized + Read + Seek> ReadAndSeek for R {}
+
+impl<'a> Archive<ReadAndSeek + 'a> {
+    fn _seek(&self, pos: u64) -> io::Result<()> {
+        if self.pos.get() == pos {
+            return Ok(())
+        }
         try!(self.obj.borrow_mut().seek(SeekFrom::Start(pos)));
         self.pos.set(pos);
         Ok(())
@@ -250,11 +227,6 @@ impl<R: Seek + Read> Archive<R> {
 }
 
 impl<R: Read> Archive<R> {
-    /// Backwards compatible alias for `entries_mut`.
-    #[doc(hidden)]
-    pub fn files_mut(&mut self) -> io::Result<EntriesMut<R>> {
-        self.entries_mut()
-    }
     /// Construct an iterator over the entries in this archive.
     ///
     /// While similar to the `entries` iterator, this iterator does not require
@@ -266,12 +238,16 @@ impl<R: Read> Archive<R> {
     /// iterator returns), then the contents read for each entry may be
     /// corrupted.
     pub fn entries_mut(&mut self) -> io::Result<EntriesMut<R>> {
-        if self.pos.get() != 0 {
-            return Err(Error::new(ErrorKind::Other, "cannot call entries_mut \
-                                                     unless archive is at \
-                                                     position 0"))
-        }
-        Ok(EntriesMut { archive: self, done: false, next: 0 })
+        let me: &mut Archive<Read> = self;
+        me._entries_mut().map(|fields| {
+            EntriesMut { fields: fields, _ignored: marker::PhantomData }
+        })
+    }
+
+    /// Backwards compatible alias for `entries_mut`.
+    #[doc(hidden)]
+    pub fn files_mut(&mut self) -> io::Result<EntriesMut<R>> {
+        self.entries_mut()
     }
 
     /// Unpacks the contents tarball into the specified `dst`.
@@ -294,11 +270,26 @@ impl<R: Read> Archive<R> {
     /// ar.unpack("foo").unwrap();
     /// ```
     pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
-        self.unpack2(dst.as_ref())
+        let me: &mut Archive<Read> = self;
+        me._unpack(dst.as_ref())
+    }
+}
+
+impl<'a> Archive<Read + 'a> {
+    fn _entries_mut(&mut self) -> io::Result<EntriesMutFields> {
+        if self.pos.get() != 0 {
+            return Err(other("cannot call entries_mut unless archive is at \
+                              position 0"))
+        }
+        Ok(EntriesMutFields {
+            archive: self,
+            done: false,
+            next: 0,
+        })
     }
 
-    fn unpack2(&mut self, dst: &Path) -> io::Result<()> {
-        'outer: for entry in try!(self.entries_mut()) {
+    fn _unpack(&mut self, dst: &Path) -> io::Result<()> {
+        'outer: for entry in try!(self._entries_mut()) {
             // TODO: although it may not be the case due to extended headers
             // and GNU extensions, assume each entry is a file for now.
             let mut file = try!(entry.map_err(|e| {
@@ -320,7 +311,7 @@ impl<R: Read> Archive<R> {
 
             let mut file_dst = dst.to_path_buf();
             {
-                let path = try!(file.header().path().map_err(|e| {
+                let path = try!(file.header.path().map_err(|e| {
                     TarError::new("invalid path in entry header", e)
                 }));
                 for part in path.components() {
@@ -349,33 +340,28 @@ impl<R: Read> Archive<R> {
                 continue
             }
 
-            let entry_type = EntryType::from_byte(file.header().link[0]);
-            if entry_type == Some(EntryType::Directory) {
-                try!(fs::create_dir_all(&file_dst).map_err(|e| {
+            if let Some(parent) = file_dst.parent() {
+                try!(fs::create_dir_all(&parent).map_err(|e| {
                     TarError::new(&format!("failed to create `{}`",
-                                           file_dst.display()), e)
+                                           parent.display()), e)
                 }));
-            } else {
-                let dir = file_dst.parent().unwrap();
-                try!(fs::create_dir_all(&dir).map_err(|e| {
-                    TarError::new(&format!("failed to create `{}`",
-                                           dir.display()), e)
-                }));
-                try!(file.unpack(&file_dst));
             }
+            try!(file._unpack(&file_dst).map_err(|e| {
+                TarError::new(&format!("failed to unpacked `{}`",
+                                       file_dst.display()), e)
+            }));
         }
         Ok(())
     }
 
-    fn skip(&self, mut amt: u64) -> io::Result<()> {
+    fn _skip(&self, mut amt: u64) -> io::Result<()> {
         let mut buf = [0u8; 4096 * 8];
         let mut me = self;
         while amt > 0 {
             let n = cmp::min(amt, buf.len() as u64);
             let n = try!(Read::read(&mut me, &mut buf[..n as usize]));
             if n == 0 {
-                let errstr = "unexpected EOF during skip";
-                return Err(Error::new(ErrorKind::Other, errstr));
+                return Err(other("unexpected EOF during skip"))
             }
             amt -= n as u64;
         }
@@ -384,8 +370,10 @@ impl<R: Read> Archive<R> {
 
     // Assumes that the underlying reader is positioned at the start of a valid
     // header to parse.
-    fn next_entry(&self, offset: &mut u64, seek: fn(&Entry<R>) -> io::Result<()>)
-                 -> io::Result<Option<Entry<R>>> {
+    fn _next_entry(&self,
+                   offset: &mut u64,
+                   seek: Box<Fn(&EntryFields) -> io::Result<()> + 'a>)
+                   -> io::Result<Option<EntryFields>> {
         // If we have 2 or more sections of 0s, then we're done!
         let mut chunk = [0; 512];
         let mut me = self;
@@ -408,7 +396,7 @@ impl<R: Read> Archive<R> {
                   32 * 8;
 
         let header: Header = unsafe { mem::transmute(chunk) };
-        let ret = Entry {
+        let ret = EntryFields {
             archive: self,
             pos: 0,
             size: try!(header.size()),
@@ -466,19 +454,9 @@ impl<W: Write> Archive<W> {
     /// ar.append(&header, &mut data).unwrap();
     /// let archive = ar.into_inner();
     /// ```
-    pub fn append(&self, header: &Header, mut data: &mut Read) -> io::Result<()> {
-        let mut obj = self.obj.borrow_mut();
-        try!(obj.write_all(header.as_bytes()));
-        let len = try!(io::copy(&mut data, &mut *obj));
-
-        // Pad with zeros if necessary.
-        let buf = [0; 512];
-        let remaining = 512 - (len % 512);
-        if remaining < 512 {
-            try!(obj.write_all(&buf[..remaining as usize]));
-        }
-
-        Ok(())
+    pub fn append(&self, header: &Header, data: &mut Read) -> io::Result<()> {
+        let me: &Archive<Write> = self;
+        me._append(header, data)
     }
 
     /// Adds a file on the local filesystem to this archive.
@@ -506,20 +484,8 @@ impl<W: Write> Archive<W> {
     /// ar.append_path("foo/bar.txt").unwrap();
     /// ```
     pub fn append_path<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        self.append_path2(path.as_ref())
-    }
-
-    fn append_path2(&self, path: &Path) -> io::Result<()> {
-        let stat = try!(fs::metadata(path));
-        let header = try!(Header::from_path_and_metadata(path, &stat));
-        if stat.is_file() {
-            let mut file = try!(fs::File::open(path));
-            self.append(&header, &mut file)
-        } else if stat.is_dir() {
-            self.append(&header, &mut io::empty())
-        } else {
-            Err(Error::new(ErrorKind::Other, "path has unknown file type"))
-        }
+        let me: &Archive<Write> = self;
+        me._append_path(path.as_ref())
     }
 
     /// Adds a file to this archive with the given path as the name of the file
@@ -550,13 +516,8 @@ impl<W: Write> Archive<W> {
     /// ```
     pub fn append_file<P: AsRef<Path>>(&self, path: P, file: &mut fs::File)
                                        -> io::Result<()> {
-        self.append_file2(path.as_ref(), file)
-    }
-
-    fn append_file2(&self, path: &Path, file: &mut fs::File) -> io::Result<()> {
-        let stat = try!(file.metadata());
-        let header = try!(Header::from_path_and_metadata(path, &stat));
-        self.append(&header, file)
+        let me: &Archive<Write> = self;
+        me._append_file(path.as_ref(), file)
     }
 
     /// Adds a directory to this archive with the given path as the name of the
@@ -584,15 +545,11 @@ impl<W: Write> Archive<W> {
     /// // with a different name.
     /// ar.append_dir("bardir", ".").unwrap();
     /// ```
-    pub fn append_dir<P: AsRef<Path>, P2: AsRef<Path>>(
-                      &self, path: P, src_path: P2) -> io::Result<()> {
-        self.append_dir2(path.as_ref(), src_path.as_ref())
-    }
-
-    fn append_dir2(&self, path: &Path, src_path: &Path) -> io::Result<()> {
-        let stat = try!(fs::metadata(src_path));
-        let header = try!(Header::from_path_and_metadata(path, &stat));
-        self.append(&header, &mut io::empty())
+    pub fn append_dir<P, Q>(&self, path: P, src_path: Q) -> io::Result<()>
+        where P: AsRef<Path>, Q: AsRef<Path>
+    {
+        let me: &Archive<Write> = self;
+        me._append_dir(path.as_ref(), src_path.as_ref())
     }
 
     /// Finish writing this archive, emitting the termination sections.
@@ -600,8 +557,64 @@ impl<W: Write> Archive<W> {
     /// This function is required to be called to complete the archive, it will
     /// be invalid if this is not called.
     pub fn finish(&self) -> io::Result<()> {
+        let me: &Archive<Write> = self;
+        me._finish()
+    }
+}
+
+impl<'a> Archive<Write + 'a> {
+    fn _append(&self, header: &Header, mut data: &mut Read) -> io::Result<()> {
+        let mut obj = self.obj.borrow_mut();
+        try!(obj.write_all(header.as_bytes()));
+        let len = try!(io::copy(&mut data, &mut &mut *obj));
+
+        // Pad with zeros if necessary.
+        let buf = [0; 512];
+        let remaining = 512 - (len % 512);
+        if remaining < 512 {
+            try!(obj.write_all(&buf[..remaining as usize]));
+        }
+
+        Ok(())
+    }
+
+    fn _append_path(&self, path: &Path) -> io::Result<()> {
+        let stat = try!(fs::metadata(path));
+        let header = try!(Header::from_path_and_metadata(path, &stat));
+        if stat.is_file() {
+            let mut file = try!(fs::File::open(path));
+            self._append(&header, &mut file)
+        } else if stat.is_dir() {
+            self._append(&header, &mut io::empty())
+        } else {
+            Err(other("path has unknown file type"))
+        }
+    }
+
+    fn _append_file(&self, path: &Path, file: &mut fs::File) -> io::Result<()> {
+        let stat = try!(file.metadata());
+        let header = try!(Header::from_path_and_metadata(path, &stat));
+        self._append(&header, file)
+    }
+
+    fn _append_dir(&self, path: &Path, src_path: &Path) -> io::Result<()> {
+        let stat = try!(fs::metadata(src_path));
+        let header = try!(Header::from_path_and_metadata(path, &stat));
+        self._append(&header, &mut io::empty())
+    }
+
+    fn _finish(&self) -> io::Result<()> {
         let b = [0; 1024];
         self.obj.borrow_mut().write_all(&b)
+    }
+}
+
+impl<'a, R: Read + ?Sized> Read for &'a Archive<R> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        self.obj.borrow_mut().read(into).map(|i| {
+            self.pos.set(self.pos.get() + i as u64);
+            i
+        })
     }
 }
 
@@ -609,50 +622,69 @@ impl<'a, R: Seek + Read> Iterator for Entries<'a, R> {
     type Item = io::Result<Entry<'a, R>>;
 
     fn next(&mut self) -> Option<io::Result<Entry<'a, R>>> {
+        self.fields.next().map(|result| {
+            result.map(|fields| {
+                Entry { fields: fields, _ignored: marker::PhantomData }
+            })
+        })
+    }
+}
+
+impl<'a> Iterator for EntriesFields<'a> {
+    type Item = io::Result<EntryFields<'a>>;
+
+    fn next(&mut self) -> Option<io::Result<EntryFields<'a>>> {
         // If we hit a previous error, or we reached the end, we're done here
         if self.done { return None }
 
         // Seek to the start of the next header in the archive
-        try_iter!(self, self.archive.seek(self.offset));
+        try_iter!(self, self.archive._seek(self.offset));
 
-        fn doseek<R: Seek + Read>(entry: &Entry<R>) -> io::Result<()> {
-            entry.archive.seek(entry.tar_offset + entry.pos)
-        }
+        let archive = self.archive;
+        let seek = Box::new(move |entry: &EntryFields| {
+            archive._seek(entry.tar_offset + entry.pos)
+        });
 
         // Parse the next entry header
-        match try_iter!(self, self.archive.next_entry(&mut self.offset, doseek)) {
-            None => { self.done = true; None }
+        let archive = self.archive_read;
+        match try_iter!(self, archive._next_entry(&mut self.offset, seek)) {
             Some(f) => Some(Ok(f)),
+            None => { self.done = true; None }
         }
     }
 }
 
-
-impl<'a, R: Read> Iterator for EntriesMut<'a, R> {
+impl<'a, R: Read + ?Sized> Iterator for EntriesMut<'a, R> {
     type Item = io::Result<Entry<'a, R>>;
 
     fn next(&mut self) -> Option<io::Result<Entry<'a, R>>> {
+        self.fields.next().map(|result| {
+            result.map(|fields| {
+                Entry { fields: fields, _ignored: marker::PhantomData }
+            })
+        })
+    }
+}
+
+impl<'a> Iterator for EntriesMutFields<'a> {
+    type Item = io::Result<EntryFields<'a>>;
+
+    fn next(&mut self) -> Option<io::Result<EntryFields<'a>>> {
         // If we hit a previous error, or we reached the end, we're done here
         if self.done { return None }
 
         // Seek to the start of the next header in the archive
         let delta = self.next - self.archive.pos.get();
-        try_iter!(self, self.archive.skip(delta));
+        try_iter!(self, self.archive._skip(delta));
 
         // no-op because this reader can't seek
-        fn doseek<R>(_: &Entry<R>) -> io::Result<()> { Ok(()) }
+        let seek = Box::new(|_: &EntryFields| Ok(()));
 
         // Parse the next entry header
-        match try_iter!(self, self.archive.next_entry(&mut self.next, doseek)) {
-            None => { self.done = true; None }
+        match try_iter!(self, self.archive._next_entry(&mut self.next, seek)) {
             Some(f) => Some(Ok(f)),
+            None => { self.done = true; None }
         }
-    }
-}
-
-impl Clone for Header {
-    fn clone(&self) -> Header {
-        Header { ..*self }
     }
 }
 
@@ -724,36 +756,7 @@ impl Header {
     /// Note that this function will convert any `\` characters to directory
     /// separators.
     pub fn path(&self) -> io::Result<Cow<Path>> {
-        return bytes2path(self.path_bytes());
-
-        #[cfg(windows)]
-        fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
-            match bytes {
-                Cow::Borrowed(bytes) => {
-                    let s = try!(str::from_utf8(bytes).map_err(|_| {
-                        not_unicode()
-                    }));
-                    Ok(Cow::Borrowed(Path::new(s)))
-                }
-                Cow::Owned(bytes) => {
-                    let s = try!(String::from_utf8(bytes).map_err(|_| {
-                        not_unicode()
-                    }));
-                    Ok(Cow::Owned(PathBuf::from(s)))
-                }
-            }
-        }
-        #[cfg(unix)]
-        fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
-            Ok(match bytes {
-                Cow::Borrowed(bytes) => Cow::Borrowed({
-                    Path::new(OsStr::from_bytes(bytes))
-                }),
-                Cow::Owned(bytes) => Cow::Owned({
-                    PathBuf::from(OsString::from_vec(bytes))
-                })
-            })
-        }
+        bytes2path(self.path_bytes())
     }
 
     /// Returns the pathname stored in this header as a byte array.
@@ -788,19 +791,11 @@ impl Header {
     /// in the appropriate format. May fail if the path is too long or if the
     /// path specified is not unicode and this is a Windows platform.
     pub fn set_path<P: AsRef<Path>>(&mut self, p: P) -> io::Result<()> {
-        self.set_path2(p.as_ref())
+        self._set_path(p.as_ref())
     }
 
-    fn set_path2(&mut self, path: &Path) -> io::Result<()> {
-        let bytes = match bytes(path) {
-            Some(b) => b,
-            None => return Err(Error::new(ErrorKind::Other, "path was not \
-                                                             valid unicode")),
-        };
-        if bytes.iter().any(|b| *b == 0) {
-            return Err(Error::new(ErrorKind::Other, "path contained a nul byte"))
-        }
-
+    fn _set_path(&mut self, path: &Path) -> io::Result<()> {
+        let bytes = try!(path2bytes(path));
         let (namelen, prefixlen) = (self.name.len(), self.prefix.len());
         if bytes.len() < namelen {
             try!(copy_into(&mut self.name, bytes, true));
@@ -808,23 +803,58 @@ impl Header {
             let prefix = &bytes[..cmp::min(bytes.len(), prefixlen)];
             let pos = match prefix.iter().rposition(|&b| b == b'/' || b == b'\\') {
                 Some(i) => i,
-                None => return Err(Error::new(ErrorKind::Other,
-                                              "path cannot be split to be \
-                                               inserted into archive")),
+                None => return Err(other("path cannot be split to be inserted \
+                                          into archive")),
             };
             try!(copy_into(&mut self.name, &bytes[pos + 1..], true));
             try!(copy_into(&mut self.prefix, &bytes[..pos], true));
         }
-        return Ok(());
+        Ok(())
+    }
 
-        #[cfg(windows)]
-        fn bytes(p: &Path) -> Option<&[u8]> {
-            p.as_os_str().to_str().map(|s| s.as_bytes())
+    /// Returns the link name stored in this header, if any is found.
+    ///
+    /// This method may fail if the pathname is not valid unicode and this is
+    /// called on a Windows platform. `Ok(None)` being returned, however,
+    /// indicates that the link name was not present.
+    ///
+    /// Note that this function will convert any `\` characters to directory
+    /// separators.
+    pub fn link_name(&self) -> io::Result<Option<Cow<Path>>> {
+        match self.link_name_bytes() {
+            Some(bytes) => bytes2path(bytes).map(Some),
+            None => Ok(None),
         }
-        #[cfg(unix)]
-        fn bytes(p: &Path) -> Option<&[u8]> {
-            Some(p.as_os_str().as_bytes())
+    }
+
+    /// Returns the link name stored in this header as a byte array, if any.
+    ///
+    /// This function is guaranteed to succeed, but you may wish to call the
+    /// `link_name` method to convert to a `Path`.
+    ///
+    /// Note that this function will convert any `\` characters to directory
+    /// separators.
+    pub fn link_name_bytes(&self) -> Option<Cow<[u8]>> {
+        if self.linkname[0] == 0 {
+            None
+        } else {
+            Some(deslash(&self.linkname))
         }
+    }
+
+    /// Sets the path name for this header.
+    ///
+    /// This function will set the pathname listed in this header, encoding it
+    /// in the appropriate format. May fail if the path is too long or if the
+    /// path specified is not unicode and this is a Windows platform.
+    pub fn set_link_name<P: AsRef<Path>>(&mut self, p: P) -> io::Result<()> {
+        self._set_link_name(p.as_ref())
+    }
+
+    fn _set_link_name(&mut self, path: &Path) -> io::Result<()> {
+        let bytes = try!(path2bytes(path));
+        try!(copy_into(&mut self.linkname, bytes, true));
+        Ok(())
     }
 
     /// Returns the mode bits for this file
@@ -954,6 +984,16 @@ impl Header {
         octal_into(&mut self.dev_minor, minor);
     }
 
+    /// Returns the type of file described by this header.
+    pub fn entry_type(&self) -> EntryType {
+        EntryType { byte: self.link[0] }
+    }
+
+    /// Sets the type of file that will be described by this header.
+    pub fn set_entry_type(&mut self, ty: EntryType) {
+        self.link[0] = ty.byte;
+    }
+
     /// Returns the checksum field of this header.
     ///
     /// May return an error if the field is corrupted.
@@ -981,15 +1021,15 @@ impl Header {
         self.set_gid(meta.gid() as u32);
 
         // TODO: need to bind more file types
-        self.link[0] = match meta.mode() & libc::S_IFMT {
-            libc::S_IFREG => EntryType::Regular,
-            libc::S_IFLNK => EntryType::Symlink,
-            libc::S_IFCHR => EntryType::Char,
-            libc::S_IFBLK => EntryType::Block,
-            libc::S_IFDIR => EntryType::Directory,
-            libc::S_IFIFO => EntryType::Fifo,
-            _ => EntryType::Unknown,
-        }.to_byte();
+        self.set_entry_type(match meta.mode() & libc::S_IFMT {
+            libc::S_IFREG => EntryType::file(),
+            libc::S_IFLNK => EntryType::symlink(),
+            libc::S_IFCHR => EntryType::character_special(),
+            libc::S_IFBLK => EntryType::block_special(),
+            libc::S_IFDIR => EntryType::dir(),
+            libc::S_IFIFO => EntryType::fifo(),
+            _ => EntryType::new(b' '),
+        });
     }
 
     #[cfg(windows)]
@@ -1009,15 +1049,15 @@ impl Header {
         self.set_gid(0);
 
         let ft = meta.file_type();
-        self.link[0] = if ft.is_dir() {
-            EntryType::Directory
+        self.set_entry_type(if ft.is_dir() {
+            EntryType::dir()
         } else if ft.is_file() {
-            EntryType::Regular
+            EntryType::file()
         } else if ft.is_symlink() {
-            EntryType::Symlink
+            EntryType::symlink()
         } else {
-            EntryType::Unknown
-        }.to_byte();
+            EntryType::new(b' ')
+        });
 
         // The dates listed in tarballs are always seconds relative to
         // January 1, 1970. On Windows, however, the timestamps are returned as
@@ -1028,11 +1068,112 @@ impl Header {
     }
 }
 
+impl Clone for Header {
+    fn clone(&self) -> Header {
+        Header { ..*self }
+    }
+}
+
+impl EntryType {
+    /// Creates a new entry type from a raw byte.
+    ///
+    /// Note that the other named constructors of entry type may be more
+    /// appropriate to create a file type from.
+    pub fn new(byte: u8) -> EntryType {
+        EntryType { byte: byte }
+    }
+
+    /// Creates a new entry type representing a regular file.
+    pub fn file() -> EntryType {
+        EntryType::new(b'0')
+    }
+
+    /// Creates a new entry type representing a hard link.
+    pub fn hard_link() -> EntryType {
+        EntryType::new(b'1')
+    }
+
+    /// Creates a new entry type representing a symlink.
+    pub fn symlink() -> EntryType {
+        EntryType::new(b'2')
+    }
+
+    /// Creates a new entry type representing a character special device.
+    pub fn character_special() -> EntryType {
+        EntryType::new(b'3')
+    }
+
+    /// Creates a new entry type representing a block special device.
+    pub fn block_special() -> EntryType {
+        EntryType::new(b'4')
+    }
+
+    /// Creates a new entry type representing a directory.
+    pub fn dir() -> EntryType {
+        EntryType::new(b'5')
+    }
+
+    /// Creates a new entry type representing a FIFO.
+    pub fn fifo() -> EntryType {
+        EntryType::new(b'6')
+    }
+
+    /// Creates a new entry type representing a contiguous file.
+    pub fn contiguous() -> EntryType {
+        EntryType::new(b'7')
+    }
+
+    /// Returns whether this type represents a regular file.
+    pub fn is_file(&self) -> bool {
+        self.byte == 0 || self.byte == b'0'
+    }
+
+    /// Returns whether this type represents a hard link.
+    pub fn is_hard_link(&self) -> bool {
+        self.byte == b'1'
+    }
+
+    /// Returns whether this type represents a symlink.
+    pub fn is_symlink(&self) -> bool {
+        self.byte == b'2'
+    }
+
+    /// Returns whether this type represents a character special device.
+    pub fn is_character_special(&self) -> bool {
+        self.byte == b'3'
+    }
+
+    /// Returns whether this type represents a block special device.
+    pub fn is_block_special(&self) -> bool {
+        self.byte == b'4'
+    }
+
+    /// Returns whether this type represents a directory.
+    pub fn is_dir(&self) -> bool {
+        self.byte == b'5'
+    }
+
+    /// Returns whether this type represents a FIFO.
+    pub fn is_fifo(&self) -> bool {
+        self.byte == b'6'
+    }
+
+    /// Returns whether this type represents a contiguous file.
+    pub fn is_contiguous(&self) -> bool {
+        self.byte == b'7'
+    }
+
+    /// Returns the raw underlying byte that this entry type represents.
+    pub fn as_byte(&self) -> u8 {
+        self.byte
+    }
+}
+
 impl<'a, R: Read> Entry<'a, R> {
     /// Returns access to the header of this entry in the archive.
     ///
     /// This provides access to the the metadata for this entry in the archive.
-    pub fn header(&self) -> &Header { &self.header }
+    pub fn header(&self) -> &Header { &self.fields.header }
 
     /// Writes this file to the specified location.
     ///
@@ -1058,30 +1199,79 @@ impl<'a, R: Read> Entry<'a, R> {
     /// }
     /// ```
     pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
-        self.unpack2(dst.as_ref())
+        self.fields._unpack(dst.as_ref())
     }
+}
 
-    fn unpack2(&mut self, dst: &Path) -> io::Result<()> {
+impl<'a, R: Read> Read for Entry<'a, R> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        self.fields.read(into)
+    }
+}
+
+impl<'a, R: Read + Seek> Seek for Entry<'a, R> {
+    fn seek(&mut self, how: SeekFrom) -> io::Result<u64> {
+        self.fields._seek(how)
+    }
+}
+
+impl<'a> EntryFields<'a> {
+    fn _unpack(&mut self, dst: &Path) -> io::Result<()> {
+        let kind = self.header.entry_type();
+        if kind.is_dir() {
+            // If the directory already exists just let it slide
+            let prev = fs::metadata(&dst);
+            if prev.map(|m| m.is_dir()).unwrap_or(false) {
+                return Ok(())
+            }
+            return fs::create_dir(&dst)
+        } else if kind.is_hard_link() || kind.is_symlink() {
+            let src = match try!(self.header.link_name()) {
+                Some(name) => name,
+                None => return Err(other("hard link listed but no link \
+                                          name found"))
+            };
+
+            return if kind.is_hard_link() {
+                fs::hard_link(&src, dst)
+            } else {
+                symlink(&src, dst)
+            };
+
+            #[cfg(windows)]
+            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+                ::std::os::windows::fs::symlink_file(src, dst)
+            }
+            #[cfg(unix)]
+            fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
+                ::std::os::unix::fs::symlink(src, dst)
+            }
+        } else if !kind.is_file() {
+            // Right now we can only otherwise handle regular files
+            return Err(other(&format!("unknown file type 0x{:x}",
+                                      kind.as_byte())))
+        };
+
         try!(fs::File::create(dst).and_then(|mut f| {
             if try!(io::copy(self, &mut f)) != self.size {
                 return Err(bad_archive());
             }
             Ok(())
         }).map_err(|e| {
-            let header = self.header().path_bytes();
+            let header = self.header.path_bytes();
             TarError::new(&format!("failed to unpack `{}` into `{}`",
                                    String::from_utf8_lossy(&header),
                                    dst.display()), e)
         }));
 
-        if let Ok(mtime) = self.header().mtime() {
+        if let Ok(mtime) = self.header.mtime() {
             let mtime = FileTime::from_seconds_since_1970(mtime, 0);
             try!(filetime::set_file_times(dst, mtime, mtime).map_err(|e| {
                 TarError::new(&format!("failed to set mtime for `{}`",
                                        dst.display()), e)
             }));
         }
-        if let Ok(mode) = self.header().mode() {
+        if let Ok(mode) = self.header.mode() {
             try!(set_perms(dst, mode).map_err(|e| {
                 TarError::new(&format!("failed to set permissions to {:o} \
                                         for `{}`", mode, dst.display()), e)
@@ -1102,18 +1292,25 @@ impl<'a, R: Read> Entry<'a, R> {
             fs::set_permissions(dst, perm)
         }
     }
-}
 
-impl<'a, R: Read> Read for &'a Archive<R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        self.obj.borrow_mut().read(into).map(|i| {
-            self.pos.set(self.pos.get() + i as u64);
-            i
-        })
+    fn _seek(&mut self, how: SeekFrom) -> io::Result<u64> {
+        let next = match how {
+            SeekFrom::Start(pos) => pos as i64,
+            SeekFrom::Current(pos) => self.pos as i64 + pos,
+            SeekFrom::End(pos) => self.size as i64 + pos,
+        };
+        if next < 0 {
+            Err(other("cannot seek before position 0"))
+        } else if next as u64 > self.size {
+            Err(other("cannot seek past end of file"))
+        } else {
+            self.pos = next as u64;
+            Ok(self.pos)
+        }
     }
 }
 
-impl<'a, R: Read> Read for Entry<'a, R> {
+impl<'a> Read for EntryFields<'a> {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
         if self.size == self.pos { return Ok(0) }
 
@@ -1125,26 +1322,54 @@ impl<'a, R: Read> Read for Entry<'a, R> {
     }
 }
 
-impl<'a, R: Read + Seek> Seek for Entry<'a, R> {
-    fn seek(&mut self, how: SeekFrom) -> io::Result<u64> {
-        let next = match how {
-            SeekFrom::Start(pos) => pos as i64,
-            SeekFrom::Current(pos) => self.pos as i64 + pos,
-            SeekFrom::End(pos) => self.size as i64 + pos,
-        };
-        if next < 0 {
-            Err(Error::new(ErrorKind::Other, "cannot seek before position 0"))
-        } else if next as u64 > self.size {
-            Err(Error::new(ErrorKind::Other, "cannot seek past end of file"))
-        } else {
-            self.pos = next as u64;
-            Ok(self.pos)
+fn bad_archive() -> Error {
+    other("invalid tar archive")
+}
+
+fn other(msg: &str) -> Error {
+    Error::new(ErrorKind::Other, msg)
+}
+
+#[cfg(windows)]
+fn path2bytes(p: &Path) -> io::Result<&[u8]> {
+    p.as_os_str().to_str().map(|s| s.as_bytes()).ok_or_else(|| {
+        other("path was not valid unicode")
+    })
+}
+
+#[cfg(unix)]
+fn path2bytes(p: &Path) -> io::Result<&[u8]> {
+    Ok(p.as_os_str().as_bytes())
+}
+
+#[cfg(windows)]
+fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
+    match bytes {
+        Cow::Borrowed(bytes) => {
+            let s = try!(str::from_utf8(bytes).map_err(|_| {
+                not_unicode()
+            }));
+            Ok(Cow::Borrowed(Path::new(s)))
+        }
+        Cow::Owned(bytes) => {
+            let s = try!(String::from_utf8(bytes).map_err(|_| {
+                not_unicode()
+            }));
+            Ok(Cow::Owned(PathBuf::from(s)))
         }
     }
 }
 
-fn bad_archive() -> Error {
-    Error::new(ErrorKind::Other, "invalid tar archive")
+#[cfg(unix)]
+fn bytes2path(bytes: Cow<[u8]>) -> io::Result<Cow<Path>> {
+    Ok(match bytes {
+        Cow::Borrowed(bytes) => Cow::Borrowed({
+            Path::new(OsStr::from_bytes(bytes))
+        }),
+        Cow::Owned(bytes) => Cow::Owned({
+            PathBuf::from(OsString::from_vec(bytes))
+        })
+    })
 }
 
 fn octal_from(slice: &[u8]) -> io::Result<u64> {
@@ -1173,6 +1398,17 @@ fn truncate<'a>(slice: &'a [u8]) -> &'a [u8] {
     }
 }
 
+fn deslash(bytes: &[u8]) -> Cow<[u8]> {
+    if !bytes.contains(&b'\\') {
+        Cow::Borrowed(truncate(bytes))
+    } else {
+        fn noslash(b: &u8) -> u8 {
+            if *b == b'\\' {b'/'} else {*b}
+        }
+        Cow::Owned(truncate(bytes).iter().map(noslash).collect())
+    }
+}
+
 fn read_all<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
     let mut read = 0;
     while read < buf.len() {
@@ -1192,9 +1428,9 @@ fn read_all<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
 /// backslashes when unpacking on Unix.
 fn copy_into(slot: &mut [u8], bytes: &[u8], map_slashes: bool) -> io::Result<()> {
     if bytes.len() > slot.len() {
-        Err(Error::new(ErrorKind::Other, "provided value is too long"))
+        Err(other("provided value is too long"))
     } else if bytes.iter().any(|b| *b == 0) {
-        Err(Error::new(ErrorKind::Other, "provided value contains a nul byte"))
+        Err(other("provided value contains a nul byte"))
     } else {
         for (slot, val) in slot.iter_mut().zip(bytes) {
             if map_slashes && *val == b'\\' {
@@ -1209,7 +1445,7 @@ fn copy_into(slot: &mut [u8], bytes: &[u8], map_slashes: bool) -> io::Result<()>
 
 #[cfg(windows)]
 fn not_unicode() -> Error {
-    Error::new(ErrorKind::Other, "only unicode paths are supported on windows")
+    other("only unicode paths are supported on windows")
 }
 
 impl TarError {
@@ -1655,7 +1891,32 @@ mod tests {
         let td = t!(TempDir::new("tar-rs"));
         let ar = Archive::new(Vec::<u8>::new());
         let err = ar.append_dir(nul_path, td.path()).unwrap_err();
-        assert!(err.to_string().contains("contained a nul byte"));
+        assert!(err.to_string().contains("contains a nul byte"));
+    }
+
+    #[test]
+    fn links() {
+        let ar = Archive::new(Cursor::new(&include_bytes!("tests/link.tar")[..]));
+        let mut entries = t!(ar.entries());
+        let link = t!(entries.next().unwrap());
+        assert_eq!(t!(link.header().link_name()).as_ref().map(|p| &**p),
+                   Some(Path::new("file")));
+        let other = t!(entries.next().unwrap());
+        assert!(t!(other.header().link_name()).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)] // making symlinks on windows is hard
+    fn unpack_links() {
+        let td = t!(TempDir::new("tar-rs"));
+        let mut ar = Archive::new(Cursor::new(&include_bytes!("tests/link.tar")[..]));
+        t!(ar.unpack(td.path()));
+
+        let md = t!(fs::symlink_metadata(td.path().join("lnk")));
+        assert!(md.file_type().is_symlink());
+        assert_eq!(&*t!(fs::read_link(td.path().join("lnk"))),
+                   Path::new("file"));
+        t!(File::open(td.path().join("lnk")));
     }
 
     #[test]
