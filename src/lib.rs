@@ -1929,13 +1929,19 @@ mod tests {
             tar.files()
                .unwrap()
                .map(|f| {
-                   let mut s = String::new();
-                   f.unwrap().read_to_string(&mut s).unwrap();
-                   s
+                   let mut f = f.unwrap();
+                   if f.header().entry_type().is_symlink() {
+                       let link_name = f.header().link_name().unwrap().unwrap();
+                       link_name.to_str().unwrap().to_owned()
+                   } else {
+                       let mut s = String::new();
+                       f.read_to_string(&mut s).unwrap();
+                       s
+                   }
                })
                .collect()
         };
-        let expected = vec!["file", "file_contents"];
+        let expected = vec!["file", "file_contents\n"];
         assert_eq!(contents, expected);
     }
 }
