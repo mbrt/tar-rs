@@ -30,7 +30,7 @@ pub struct Entries<'a, R: 'a + Read> {
 }
 
 struct EntriesFields<'a> {
-    archive: &'a Archive<Read + 'a>,
+    archive: &'a ArchiveInner<Read + 'a>,
     next: u64,
     done: bool,
     raw: bool,
@@ -60,7 +60,7 @@ impl<R: Read> Archive<R> {
     /// corrupted.
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
         let me: &mut Archive<Read> = self;
-        me._entries().map(|fields| {
+        me.inner._entries().map(|fields| {
             Entries { fields: fields, _ignored: marker::PhantomData }
         })
     }
@@ -86,13 +86,13 @@ impl<R: Read> Archive<R> {
     /// ```
     pub fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
         let me: &mut Archive<Read> = self;
-        me._unpack(dst.as_ref())
+        me.inner._unpack(dst.as_ref())
     }
 }
 
-impl<'a> Archive<Read + 'a> {
+impl<'a> ArchiveInner<Read + 'a> {
     fn _entries(&mut self) -> io::Result<EntriesFields> {
-        if self.inner.pos.get() != 0 {
+        if self.pos.get() != 0 {
             return Err(other("cannot call entries unless archive is at \
                               position 0"))
         }
@@ -172,13 +172,20 @@ impl<'a> Archive<Read + 'a> {
         let mut buf = [0u8; 4096 * 8];
         while amt > 0 {
             let n = cmp::min(amt, buf.len() as u64);
-            let n = try!((&self.inner).read(&mut buf[..n as usize]));
+            let n = try!(self.read(&mut buf[..n as usize]));
             if n == 0 {
                 return Err(other("unexpected EOF during skip"))
             }
             amt -= n as u64;
         }
         Ok(())
+    }
+
+    fn read(&self, into: &mut [u8]) -> io::Result<usize> {
+        self.obj.borrow_mut().read(into).map(|i| {
+            self.pos.set(self.pos.get() + i as u64);
+            i
+        })
     }
 }
 
@@ -211,11 +218,11 @@ impl<'a, R: Read> Iterator for Entries<'a, R> {
 impl<'a> EntriesFields<'a> {
     fn next_entry_raw(&mut self) -> io::Result<Option<Entry<'a, io::Empty>>> {
         // Seek to the start of the next header in the archive
-        let delta = self.next - self.archive.inner.pos.get();
+        let delta = self.next - self.archive.pos.get();
         try!(self.archive.skip(delta));
 
         let mut header = Header::new_old();
-        try!(read_all(&mut &self.archive.inner, header.as_mut_bytes()));
+        try!(read_all(&mut self.archive, header.as_mut_bytes()));
         self.next += 512;
 
         // If we have an all 0 block, then this should be the start of the end
@@ -223,8 +230,7 @@ impl<'a> EntriesFields<'a> {
         // the checksum), so if it's all zero it must be the first of the two
         // end blocks
         if header.as_bytes().iter().all(|i| *i == 0) {
-            try!(read_all(&mut &self.archive.inner,
-                                     header.as_mut_bytes()));
+            try!(read_all(&mut self.archive, header.as_mut_bytes()));
             self.next += 512;
             return if header.as_bytes().iter().all(|i| *i == 0) {
                 Ok(None)
@@ -247,7 +253,7 @@ impl<'a> EntriesFields<'a> {
         let ret = EntryFields {
             size: size,
             header: header,
-            data: (&self.archive.inner).take(size),
+            data: (&self.archive).take(size),
             long_pathname: None,
             long_linkname: None,
             pax_extensions: None,
